@@ -7,8 +7,8 @@ import ofetch from '@/utils/ofetch';
 
 export const rootUrl = 'https://www.36kr.com';
 
-export const ProcessItem = (item, tryGet) =>
-    tryGet(item.link, async () => {
+export const ProcessItem = (item) =>
+    cache.tryGet(item.link, async () => {
         const detailResponse = await ofetch(item.link);
 
         const cipherTextList = detailResponse.match(/\{"state":"(.*)","isEncrypt":true\}/) ?? [];
@@ -42,6 +42,10 @@ export const getWafTokenId = () =>
             const payload = $('script')
                 .text()
                 .match(/atob\('(.*?)'\)\),/)?.[1];
+            if (!payload) {
+                return;
+            }
+
             const response = solveWafChallenge(payload);
 
             const tokenIdResponse = await ofetch.raw(rootUrl, {
@@ -57,7 +61,7 @@ export const getWafTokenId = () =>
                 ?.split(';', 1)[0]
                 .split('=', 2)[1];
 
-            return _wafTokenId as string;
+            return _wafTokenId;
         },
         300, // server-provided value
         false

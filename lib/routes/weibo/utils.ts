@@ -17,7 +17,26 @@ class RenewWeiboCookiesError extends Error {
     }
 }
 
-const getDescriptionRenderParams = (routeParams, params = {}) => ({
+interface FormatExtendedParams {
+    readable?: boolean;
+    authorNameBold?: boolean;
+    showAuthorInTitle?: boolean;
+    showAuthorInDesc?: boolean;
+    showAuthorAvatarInDesc?: boolean;
+    showAtBeforeAuthor?: boolean;
+    showEmojiForRetweet?: boolean;
+    showRetweetTextInTitle?: boolean;
+    addLinkForPics?: boolean;
+    showTimestampInDescription?: boolean;
+    widthOfPics?: number;
+    heightOfPics?: number;
+    sizeOfAuthorAvatar?: number;
+    showEmojiInDescription?: boolean;
+    showLinkIconInDescription?: boolean;
+    preferMobileLink?: boolean;
+}
+
+const getDescriptionRenderParams = (routeParams, params: FormatExtendedParams = {}) => ({
     showEmojiInDescription: fallback(params.showEmojiInDescription, queryToInteger(routeParams.showEmojiInDescription), false),
     showLinkIconInDescription: fallback(params.showLinkIconInDescription, queryToInteger(routeParams.showLinkIconInDescription), true),
 });
@@ -45,39 +64,33 @@ const weiboUtils = {
     RenewWeiboCookiesError,
     getCookies: (() => {
         const url = 'https://m.weibo.cn/';
+        const cacheKey = 'weibo:visitor-cookies';
         const coolingDownMessage = `Cooling down before new visitor Cookies from ${url} may be fetched`;
         let coolingDown = false;
+        let visitorCookiesPromise: Promise<string> | undefined;
 
-        return async (renew: any = false) => {
-            if (config.weibo.cookies) {
-                if (renew) {
-                    throw new Error('Cookies expired. Please update WEIBO_COOKIES');
-                }
-                return config.weibo.cookies;
+        const fetchVisitorCookies = async (renew: any = false) => {
+            if (visitorCookiesPromise) {
+                return await visitorCookiesPromise;
             }
+            if (coolingDown) {
+                if (renew?.message) {
+                    logger.warn(coolingDownMessage);
+                    throw renew;
+                }
+                throw new Error(coolingDownMessage);
+            }
+            coolingDown = true;
+            setTimeout(() => {
+                coolingDown = false;
+            }, config.cache.routeExpire * 1000);
 
-            const cacheKey = 'weibo:visitor-cookies';
             if (renew) {
-                cache.set(cacheKey, '', 1);
+                logger.warn(`Renewing visitor Cookies from ${url}`);
+            } else {
+                logger.info(`Fetching visitor Cookies from ${url}`);
             }
-            return await cache.tryGet(cacheKey, async () => {
-                if (coolingDown) {
-                    if (renew?.message) {
-                        logger.warn(coolingDownMessage);
-                        throw renew;
-                    }
-                    throw new Error(coolingDownMessage);
-                }
-                coolingDown = true;
-                setTimeout(() => {
-                    coolingDown = false;
-                }, config.cache.routeExpire * 1000);
-
-                if (renew) {
-                    logger.warn(`Renewing visitor Cookies from ${url}`);
-                } else {
-                    logger.info(`Fetching visitor Cookies from ${url}`);
-                }
+            visitorCookiesPromise = (async () => {
                 let times = 0;
                 const { page, destroy } = await getPlaywrightPage(url, {
                     onBeforeLoad: async (page) => {
@@ -98,13 +111,40 @@ const weiboUtils = {
                     },
                     gotoConfig: { waitUntil: 'networkidle' },
                 });
-                const cookies: string = await getCookies(page, 'weibo.cn');
-                await destroy();
-                if (times < 2 || !cookies) {
-                    throw new Error(`Unable to fetch visitor cookies. Please set WEIBO_COOKIES. Redirection: ${times}, last URL: ${page.url()}`);
+                let cookies: string;
+                try {
+                    cookies = await getCookies(page, 'weibo.cn');
+                    if (times < 2 || !cookies) {
+                        throw new Error(`Unable to fetch visitor cookies. Please set WEIBO_COOKIES. Redirection: ${times}, last URL: ${page.url()}`);
+                    }
+                } finally {
+                    await destroy();
+                }
+                if (renew) {
+                    await cache.set(cacheKey, cookies);
                 }
                 return cookies;
-            });
+            })();
+
+            try {
+                return await visitorCookiesPromise;
+            } finally {
+                visitorCookiesPromise = undefined;
+            }
+        };
+
+        return async (renew: any = false) => {
+            if (config.weibo.cookies) {
+                if (renew) {
+                    throw new Error('Cookies expired. Please update WEIBO_COOKIES');
+                }
+                return config.weibo.cookies;
+            }
+
+            if (renew) {
+                return await fetchVisitorCookies(renew);
+            }
+            return await cache.tryGet(cacheKey, fetchVisitorCookies);
         };
     })(),
     tryWithCookies: (() => {
@@ -121,7 +161,7 @@ const weiboUtils = {
                 if (error.message?.includes('WEIBO_COOKIES')) {
                     throw error;
                 }
-                if (errors > 10) {
+                if (errors > 10 && !config.weibo.cookies) {
                     logger.warn(`Too many errors while fetching data from weibo API, renewing Cookies: ${error.message}`);
                     logger.info('Please open an issue on GitHub if renewing Cookies fixes the error');
                 } else if ((error.name === 'HTTPError' || error.name === 'FetchError') && error.status === 432) {
@@ -147,7 +187,7 @@ const weiboUtils = {
             .replaceAll(/<[^<]*>/g, '')
             .replaceAll('\n', ' ')
             .trim(),
-    formatExtended: (ctx, status, uid, params = {}, picsPrefixes = []) => {
+    formatExtended: (ctx, status, uid?, params: FormatExtendedParams = {}, picsPrefixes: string[] = []) => {
         // `uid = undefined` to explicitly mark it as optional, avoiding IDEs prompting warnings
 
         // undefined and strings like "1" is also safely parsed, so no if branch is needed
@@ -192,7 +232,7 @@ const weiboUtils = {
             heightOfPics,
             sizeOfAuthorAvatar,
             preferMobileLink,
-        } = params;
+        } = mergedParams;
 
         let retweeted = '';
         // 长文章的处理
@@ -235,7 +275,7 @@ const weiboUtils = {
         // status.pics can be either an array or an object:
         // array: [ object, object, ... ]
         // object: { '0': object, '1': object, ... }  // REALLY AMAZING data structure
-        if (status.pics && !Array.isArray(status.pics) && typeof status.pics === 'object') {
+        if (status.pics && !Array.isArray(status.pics)) {
             status.pics = Object.values(status.pics);
         }
 
@@ -321,10 +361,12 @@ const weiboUtils = {
                 };
             }
             // 插入转发的微博
-            const retweetedParams = Object.assign({}, params);
-            retweetedParams.showAuthorInDesc = true;
-            retweetedParams.showAuthorAvatarInDesc = false;
-            retweetedParams.showAtBeforeAuthor = true;
+            const retweetedParams: FormatExtendedParams = {
+                ...params,
+                showAuthorInDesc: true,
+                showAuthorAvatarInDesc: false,
+                showAtBeforeAuthor: true,
+            };
             retweeted += weiboUtils.formatExtended(ctx, status.retweeted_status, undefined, retweetedParams, picsPrefixes).description;
 
             html += retweeted;
@@ -365,7 +407,7 @@ const weiboUtils = {
             title += ' [视频]';
         }
 
-        uid = uid || status.user?.id;
+        uid ||= status.user?.id;
         const bid = status.bid || status.id;
         const guid = uid ? `https://weibo.com/${uid}/${bid}` : `https://m.weibo.cn/status/${bid}`;
         const link = preferMobileLink ? `https://m.weibo.cn/status/${bid}` : guid;
@@ -501,22 +543,22 @@ const weiboUtils = {
                 // 正文处理，加入一些在微博文章页的 CSS 中定义的不可或缺的样式
                 const $ = load(content);
                 $('p').each((_, elem) => {
-                    elem = $(elem);
-                    let style = elem.attr('style') || '';
+                    const $elem = $(elem);
+                    let style = $elem.attr('style') || '';
                     style = 'margin: 0;padding: 0;border: 0;' + style;
-                    elem.attr('style', style);
+                    $elem.attr('style', style);
                 });
                 $('.image').each((_, elem) => {
-                    elem = $(elem);
-                    let style = elem.attr('style') || '';
+                    const $elem = $(elem);
+                    let style = $elem.attr('style') || '';
                     style = 'display: table;text-align: center;margin-left: auto;margin-right: auto;clear: both;min-width: 50px;' + style;
-                    elem.attr('style', style);
+                    $elem.attr('style', style);
                 });
                 $('img').each((_, elem) => {
-                    elem = $(elem);
-                    let style = elem.attr('style') || '';
+                    const $elem = $(elem);
+                    let style = $elem.attr('style') || '';
                     style = 'display: block;max-width: 100%;margin-left: auto;margin-right: auto;min-width: 50px;' + style;
-                    elem.attr('style', style);
+                    $elem.attr('style', style);
                 });
                 const contentHtml = $.html();
                 html += `<div style="line-height: 1.59;text-align: justify;font-size: 1.0625rem;color: #333;">${contentHtml}</div>`; // 正文
